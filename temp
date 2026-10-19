@@ -1,0 +1,47 @@
+/* ---- you already have: ----
+ *   sa        = your SA found by old SPI
+ *   new_sec   = rte_security_session_create(...) result  (check != NULL!)
+ */
+
+struct rte_ipsec_session new_ss;
+
+/* 1. wrap the new security session in an rte_ipsec_session */
+memset(&new_ss, 0, sizeof(new_ss));
+new_ss.type              = RTE_IPSEC_SES_TYPE_LOOKASIDE_PROTOCOL;
+new_ss.security.ctx      = sa->ss[0].security.ctx;  /* same dpaa_sec dev */
+new_ss.security.session  = new_sec;
+
+/* 2. validate/prepare it */
+rc = rte_ipsec_session_prepare(&new_ss);
+if (rc != 0) {
+    rte_security_session_destroy(new_ss.security.ctx, new_sec);
+    return rc;                       /* old session still in use, nothing lost */
+}
+
+/* 3. save the old session so you can destroy it later */
+old_ss   = sa->ss[0];                /* struct copy of the OLD binding      */
+old_sec  = old_ss.security.session;  /* actual old session pointer          */
+
+/* 4. THE step you're missing: bind new session to the rte_ipsec_sa */
+rc = rte_ipsec_session_update(sa->sa, &new_ss, &old_ss);
+/* on older DPDK (< 20.11):  rc = rte_ipsec_session_update(sa->sa, &new_ss); */
+if (rc != 0) {
+    rte_security_session_destroy(new_ss.security.ctx, new_sec);
+    return rc;                       /* still on old session */
+}
+
+/* 5. publish it: make the datapath SA entry point at the new session */
+sa->ss[0] = new_ss;                  /* workers read this field every packet */
+
+/* 6. update your bookkeeping */
+sa->spi     = msg->new_spi;
+memcpy(sa->key, msg->key, msg->key_len);
+sa->key_len = msg->key_len;
+
+/* 7. NOW, and only now, get rid of the old one —
+ *    ideally after workers have gone quiescent and crypto queues drained: */
+rc = rte_security_session_destroy(old_ss.security.ctx, old_sec);
+if (rc != 0)
+    RTE_LOG(WARNING, REKEY, "old session destroy rc=%d (in-flight ops?)\n", rc);
+
+return 0;
