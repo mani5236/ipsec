@@ -45,3 +45,68 @@ if (rc != 0)
     RTE_LOG(WARNING, REKEY, "old session destroy rc=%d (in-flight ops?)\n", rc);
 
 return 0;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Given only what you’ve told me so far (NXP DPDK, LS1046, ipsec-secgw tunnel mode with protocol offload working but unstable, transport and non-offload tunnel not working), here is a checklist in the order I’d work through it. Each item is a quick test, so you can rule things out fast.
+
+A. Confirm what kind of fluctuation it is (10 minutes)
+
+Run UDP at a fixed rate (iperf3 -u -b 850M -l 1400) instead of TCP. Flat line means your data path is fine and TCP is reacting to loss or reordering. Still fluctuating means the problem is in the device or software.
+Note whether the dip is periodic (every N seconds) or random. Periodic usually points to a timer, a pool refill, or a kernel interrupt on your core. Random usually points to drops or reordering.
+
+B. Counters to read during a dip
+3. Port stats and xstats: look for rx/tx drops, rx_nombuf, and any BMan or QMan congestion or tail-drop counters.
+4. Cryptodev stats: enqueue errors, dequeue errors, and anything on anti-replay failures.
+5. dmesg and the DPDK logs: look for SEC errors, FQ errors or CGR (congestion group) messages.
+
+C. Likely culprits for protocol offload
+6. Anti-replay and reordering: use one SA, one queue, one core and see if it stabilizes. If it does, reordering is the cause, so look at the replay window size and the RX queue distribution.
+7. Single flow: one tunnel with one flow lands on one frame queue. Try multiple parallel flows.
+8. MTU and fragmentation: set the inner MTU to about 1400 and check there’s no fragmentation or drops of packets over the limit.
+9. Mempool sizing: increase mbuf pool count, burst size and ring/queue depth, since a pool running dry in bursts causes exactly this kind of dip.
+
+D. System setup
+10. Hugepages are allocated and used.
+11. The data cores are isolated (isolcpus, nohz_full, rcu_nocbs) and the lcores are pinned to them.
+12. The CPU governor is performance and there’s no thermal throttling.
+13. The kernel dpaa_eth driver, or another process, isn’t touching the same ports, portals or FQs.
+14. LS1046 has four A72 cores, so check that crypto, RX and TX aren’t all competing on the same one.
+
+E. Transport mode and non-offload tunnel failing
+These are most likely separate problems from the fluctuation, so treat them separately:
+15. Check the SA creation log: does session creation fail, or does the SA come up and traffic just drops?
+16. Check whether your build and the dpaa_sec PMD actually support transport mode and the software (inline or lookaside-none) ESP path for your chosen algorithm. If the PMD only supports protocol offload on your SDK version, this behavior is expected rather than a bug.
+17. Check the SP/SA config: direction, mode (transport/ipv4-tunnel), SPI, and the type field (lookaside-protocol-offload vs no-offload).
+
+F. What I need to go further
+
+DPDK version and whether it’s the NXP LSDK fork
+the ipsec-secgw command line and SA/SP/rt config
+cipher/auth algorithm
+iperf options, packet size and number of flows
+the error output from the transport and non-offload runs
+port, xstats and crypto stats captured during a dip
+
+If you can only give me one thing first, give me the stats output captured during a dip plus the command line and SA config. Those will narrow it down fastest.
